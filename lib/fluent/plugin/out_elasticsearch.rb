@@ -14,6 +14,11 @@ require_relative 'elasticsearch_index_template'
 
 class Fluent::ElasticsearchOutput < Fluent::ObjectBufferedOutput
   class ConnectionFailure < StandardError; end
+  class BulkIndexQueueFull < StandardError; end
+  class ElasticsearchOutOfMemory < StandardError; end
+  class ElasticsearchVersionMismatch < StandardError; end
+  class UnrecognizedElasticsearchError < StandardError; end
+  class ElasticsearchError < StandardError; end
 
   Fluent::Plugin.register_output('elasticsearch', self)
 
@@ -285,8 +290,10 @@ class Fluent::ElasticsearchOutput < Fluent::ObjectBufferedOutput
     bulk_message = ''
     header = {}
     meta = {}
-
+    records = 0
+    bulk_message_count = 0
     chunk.msgpack_each do |time, record|
+      records += 1
       next unless record.is_a? Hash
 
       if @flatten_hashes
@@ -347,9 +354,10 @@ class Fluent::ElasticsearchOutput < Fluent::ObjectBufferedOutput
       end
 
       append_record_to_messages(@write_operation, meta, header, record, bulk_message)
+      bulk_message_count += 1
     end
 
-    send_bulk(bulk_message) unless bulk_message.empty?
+    send_bulk(bulk_message, bulk_message_count) unless bulk_message.empty?
     bulk_message.clear
   end
 
@@ -360,12 +368,78 @@ class Fluent::ElasticsearchOutput < Fluent::ObjectBufferedOutput
     [parent_object, path[-1]]
   end
 
-  def send_bulk(data)
+  def send_bulk(data, count)
     retries = 0
     begin
       response = client.bulk body: data
       if response['errors']
-        log.error "Could not push log to Elasticsearch: #{response}"
+        errors = Hash.new(0)
+        errors_bad_resp = 0
+        errors_unrecognized = 0
+        successes = 0
+        duplicates = 0
+        bad_arguments = 0
+        # Count up the individual error types returned for each item
+        response['items'].each do |item|
+          if item[@write_operation].has_key?('status')
+            status = item[@write_operation]['status']
+          else
+            # When we don't have a status field, something changed in the API
+            # expected return values (ES 2.x)
+            errors_bad_resp += 1
+            next
+          end
+          if CREATE_OP == @write_operation && 409 == status
+            duplicates += 1
+          elsif 400 == status
+            bad_arguments += 1
+            log.debug "Elasticsearch rejected document: #{item}"
+          elsif [429, 500].include?(status)
+            if item[@write_operation].has_key?('error') && item[@write_operation]['error'].has_key?('type')
+              type = item[@write_operation]['error']['type']
+            else
+              # When we don't have a type field, something changed in the API
+              # expected return values (ES 2.x)
+              errors_bad_resp += 1
+              next
+            end
+            errors[type] += 1
+          elsif [200, 201].include?(status)
+            successes += 1
+          else
+            errors_unrecognized += 1
+          end
+        end
+        if errors_bad_resp > 0
+          msg = "Unable to parse error response from Elasticsearch, likely an API version mismatch  #{response}"
+          log.error msg
+          raise ElasticsearchVersionMismatch, msg
+        end
+        if bad_arguments > 0
+          log.warn "Elasticsearch rejected #{bad_arguments} documents due to invalid field arguments"
+        end
+        if duplicates > 0
+          log.info "Encountered #{duplicates} duplicate(s) of #{successes} indexing chunk, ignoring"
+        end
+        msg = "Indexed (op = #{@write_operation}) #{successes} successfully, #{duplicates} duplicate(s), #{bad_arguments} bad argument(s), #{errors_unrecognized} unrecognized error(s)"
+        errors.each_key do |key|
+          msg << ", #{errors[key]} #{key} error(s)"
+        end
+        log.debug msg
+        if errors_unrecognized > 0
+          raise UnrecognizedElasticsearchError, "Unrecognized elasticsearch errors returned, retrying  #{response}"
+        end
+        errors.each_key do |key|
+          if 'out_of_memory_error' == key
+            raise ElasticsearchOutOfMemory, "Elasticsearch has exhausted its heap, retrying"
+          elsif 'es_rejected_execution_exception' == key
+            raise BulkIndexQueueFull, "Bulk index queue is full, retrying"
+          else
+            raise ElasticsearchError, "Elasticsearch errors returned, retrying  #{response}"
+          end
+        end
+      else
+        log.debug "Successfully indexed (op = #{@write_operation}) #{count} documents"
       end
     rescue *client.transport.host_unreachable_exceptions => e
       if retries < 2

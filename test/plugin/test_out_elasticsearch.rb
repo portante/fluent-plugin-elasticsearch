@@ -1,5 +1,6 @@
 require 'helper'
 require 'date'
+require 'json'
 
 class ElasticsearchOutput < Test::Unit::TestCase
   attr_accessor :index_cmds, :index_command_counts
@@ -51,6 +52,104 @@ class ElasticsearchOutput < Test::Unit::TestCase
       index_cmds = req.body.split("\n").map {|r| JSON.parse(r) }
       @index_command_counts[url] += index_cmds.size
     end
+  end
+
+  def make_response_body(req, error_el = nil, error_status = nil, error = nil)
+    req_index_cmds = req.body.split("\n").map { |r| JSON.parse(r) }
+    items = []
+    count = 0
+    ids = 1
+    op = nil
+    index = nil
+    type = nil
+    id = nil
+    req_index_cmds.each do |cmd|
+      if count.even?
+        op = cmd.keys[0]
+        index = cmd[op]['_index']
+        type = cmd[op]['_type']
+        if cmd[op].has_key?('_id')
+          id = cmd[op]['_id']
+        else
+          id = ids
+          ids += 1
+        end
+      else
+        item = {
+          op => {
+            '_index' => index, '_type' => type, '_id' => id, '_version' => 1,
+            '_shards' => { 'total' => 1, 'successful' => 1, 'failed' => 0 },
+            'status' => op == 'create' ? 201 : 200
+          }
+        }
+        items.push(item)
+      end
+      count += 1
+    end
+    if !error_el.nil? && !error_status.nil? && !error.nil?
+      op = items[error_el].keys[0]
+      items[error_el][op].delete('_version')
+      items[error_el][op].delete('_shards')
+      items[error_el][op]['error'] = error
+      items[error_el][op]['status'] = error_status
+      errors = true
+    else
+      errors = false
+    end
+    body = { 'took' => 6, 'errors' => errors, 'items' => items }
+    return body.to_json
+  end
+
+  def stub_elastic_bad_argument(url="http://localhost:9200/_bulk")
+    error = {
+      "type" => "mapper_parsing_exception",
+      "reason" => "failed to parse [...]",
+      "caused_by" => {
+        "type" => "illegal_argument_exception",
+        "reason" => "Invalid format: \"...\""
+      }
+    }
+    stub_request(:post, url).to_return(lambda { |req| { :status => 200, :body => make_response_body(req, 1, 400, error), :headers => { 'Content-Type' => 'json' } } })
+  end
+
+  def stub_elastic_bulk_error(url="http://localhost:9200/_bulk")
+    error = {
+      "type" => "some-unrecognized-error",
+      "reason" => "some message printed here ...",
+    }
+    stub_request(:post, url).to_return(lambda { |req| { :status => 200, :body => make_response_body(req, 1, 500, error), :headers => { 'Content-Type' => 'json' } } })
+  end
+
+  def stub_elastic_bulk_rejected(url="http://localhost:9200/_bulk")
+    error = {
+      "type" => "es_rejected_execution_exception",
+      "reason" => "rejected execution of org.elasticsearch.transport.TransportService$4@1a34d37a on EsThreadPoolExecutor[bulk, queue capacity = 50, org.elasticsearch.common.util.concurrent.EsThreadPoolExecutor@312a2162[Running, pool size = 32, active threads = 32, queued tasks = 50, completed tasks = 327053]]"
+    }
+    stub_request(:post, url).to_return(lambda { |req| { :status => 200, :body => make_response_body(req, 1, 429, error), :headers => { 'Content-Type' => 'json' } } })
+  end
+
+  def stub_elastic_out_of_memory(url="http://localhost:9200/_bulk")
+    error = {
+      "type" => "out_of_memory_error",
+      "reason" => "Java heap space"
+    }
+    stub_request(:post, url).to_return(lambda { |req| { :status => 200, :body => make_response_body(req, 1, 500, error), :headers => { 'Content-Type' => 'json' } } })
+  end
+
+  def stub_elastic_unrecognized_error(url="http://localhost:9200/_bulk")
+    error = {
+      "type" => "some-other-type",
+      "reason" => "some-other-reason"
+    }
+    stub_request(:post, url).to_return(lambda { |req| { :status => 200, :body => make_response_body(req, 1, 504, error), :headers => { 'Content-Type' => 'json' } } })
+  end
+
+  def stub_elastic_version_mismatch(url="http://localhost:9200/_bulk")
+    error = {
+      "category" => "some-other-type",
+      "reason" => "some-other-reason"
+    }
+    stub_request(:post, url).to_return(lambda { |req| { :status => 200, :body => make_response_body(req, 1, 500, error), :headers => { 'Content-Type' => 'json' } } })
   end
 
   def test_configure
@@ -818,7 +917,6 @@ class ElasticsearchOutput < Test::Unit::TestCase
     assert_equal(index_cmds[1]['@timestamp'], ts)
   end
 
-
   def test_uses_custom_time_key_format_obscure_format
     driver.configure("logstash_format true
                       time_key_format %a %b %d %H:%M:%S %Z %Y\n")
@@ -1060,6 +1158,88 @@ class ElasticsearchOutput < Test::Unit::TestCase
       driver.run
     }
     assert_equal(connection_resets, 1)
+  end
+
+  def test_bulk_bad_arguments
+    log = driver.instance.router.emit_error_handler.log
+    log.level = 'debug'
+
+    stub_elastic_ping
+    stub_elastic_bad_argument
+
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    driver.run
+
+    matches = log.out.logs.grep /Elasticsearch rejected document:/
+    assert_equal(1, matches.length, "Message 'Elasticsearch rejected document: ...' was not emitted")
+    matches = log.out.logs.grep /documents due to invalid field arguments/
+    assert_equal(1, matches.length, "Message 'Elasticsearch rejected # documents due to invalid field arguments ...' was not emitted")
+  end
+
+  def test_bulk_error
+    stub_elastic_ping
+    stub_elastic_bulk_error
+
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    assert_raise(Fluent::ElasticsearchOutput::ElasticsearchError) {
+      driver.run
+    }
+  end
+
+  def test_bulk_error_version_mismatch
+    stub_elastic_ping
+    stub_elastic_version_mismatch
+
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+
+    assert_raise(Fluent::ElasticsearchOutput::ElasticsearchVersionMismatch) {
+      driver.run
+    }
+  end
+
+  def test_bulk_error_unrecognized_error
+    stub_elastic_ping
+    stub_elastic_unrecognized_error
+
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+
+    assert_raise(Fluent::ElasticsearchOutput::UnrecognizedElasticsearchError) {
+      driver.run
+    }
+  end
+
+  def test_bulk_error_out_of_memory
+    stub_elastic_ping
+    stub_elastic_out_of_memory
+
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+
+    assert_raise(Fluent::ElasticsearchOutput::ElasticsearchOutOfMemory) {
+      driver.run
+    }
+  end
+
+  def test_bulk_error_queue_full
+    stub_elastic_ping
+    stub_elastic_bulk_rejected
+
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+    driver.emit(sample_record)
+
+    assert_raise(Fluent::ElasticsearchOutput::BulkIndexQueueFull) {
+      driver.run
+    }
   end
 
   def test_update_should_not_write_if_theres_no_id
